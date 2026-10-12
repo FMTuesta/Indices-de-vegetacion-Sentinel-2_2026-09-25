@@ -1,0 +1,266 @@
+
+/************************************************************
+ SENTINEL-2: INDICES DE VEGETACION Y NUBES/SOMBRAS
+ Fecha exclusiva: 2026-09-25
+ Escala de indices: 10 m
+ Exportacion: CSV a Google Drive
+************************************************************/
+
+
+// ==========================================================
+// 1. CONFIGURACION
+// ==========================================================
+
+var sectores = ee.FeatureCollection(
+  'projects/ee-fernandatuesta/assets/sendero30x10m_52s'
+);
+
+var fechaMuestreo = ee.Date('2026-09-25');
+var inicio = fechaMuestreo;
+var fin = fechaMuestreo.advance(1, 'day');
+
+var L = 0.5;
+
+Map.centerObject(sectores, 15);
+Map.addLayer(sectores, {}, 'Sectores de muestreo');
+
+print('Cantidad de sectores:', sectores.size());
+print('Fecha buscada:', fechaMuestreo.format('YYYY-MM-dd'));
+
+
+// ==========================================================
+// 2. COLECCION SENTINEL-2
+// ==========================================================
+
+var S2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(sectores.geometry())
+  .filterDate(inicio, fin);
+
+print('Cantidad de imagenes Sentinel-2:', S2.size());
+
+print(
+  'Fechas y horas de adquisicion:',
+  S2.aggregate_array('system:time_start').map(function(t) {
+    return ee.Date(t).format('YYYY-MM-dd HH:mm');
+  })
+);
+
+
+// ==========================================================
+// 3. CALCULAR INDICES DE VEGETACION
+// ==========================================================
+
+function calcularIndices(blue, red, nir) {
+
+  var ndvi = nir.subtract(red)
+    .divide(nir.add(red))
+    .rename('NDVI');
+
+  var savi = nir.subtract(red)
+    .divide(nir.add(red).add(L))
+    .multiply(1 + L)
+    .rename('SAVI');
+
+  var evi = nir.subtract(red)
+    .multiply(2.5)
+    .divide(
+      nir.add(red.multiply(6))
+        .subtract(blue.multiply(7.5))
+        .add(1)
+    )
+    .rename('EVI');
+
+  return ndvi.addBands(savi).addBands(evi);
+}
+
+
+// ==========================================================
+// 4. PREPARAR IMAGEN SENTINEL-2
+// ==========================================================
+
+function prepararS2(image) {
+
+  image = ee.Image(image);
+
+  var scl = image.select('SCL');
+
+  // Nubes: clases SCL 8, 9 y 10
+  var nube = scl.eq(8)
+    .or(scl.eq(9))
+    .or(scl.eq(10))
+    .rename('nube');
+
+  // Sombras de nubes: clase SCL 3
+  var sombra = scl.eq(3)
+    .rename('sombra');
+
+  // Excluir clases no validas para calcular los indices
+  var mascaraValida = scl.neq(0)
+    .and(scl.neq(1))
+    .and(scl.neq(3))
+    .and(scl.neq(7))
+    .and(scl.neq(8))
+    .and(scl.neq(9))
+    .and(scl.neq(10))
+    .and(scl.neq(11));
+
+  // Reflectancia de superficie Sentinel-2
+  var reflectancia = image
+    .select(['B2', 'B4', 'B8'])
+    .multiply(0.0001);
+
+  var blue = reflectancia.select('B2');
+  var red = reflectancia.select('B4');
+  var nir = reflectancia.select('B8');
+
+  // Calcular indices y excluir pixeles no validos
+  var indices = calcularIndices(blue, red, nir)
+    .updateMask(mascaraValida);
+
+  // Conservar nube y sombra para calcular sus porcentajes
+  return indices
+    .addBands(nube)
+    .addBands(sombra)
+    .copyProperties(image, image.propertyNames());
+}
+
+
+// ==========================================================
+// 5. EXTRAER INDICES Y PORCENTAJES POR SECTOR
+// ==========================================================
+
+function extraerPorSector(image) {
+
+  image = ee.Image(image);
+
+  var fechaImagen = ee.Date(
+    image.get('system:time_start')
+  );
+
+  // Hora local argentina (UTC-3)
+  var fechaLocal = fechaImagen.advance(-3, 'hour');
+
+  var datos = image.reduceRegions({
+    collection: sectores,
+    reducer: ee.Reducer.mean(),
+    scale: 10,
+    tileScale: 4
+  });
+
+  var salida = datos.map(function(feature) {
+
+    feature = ee.Feature(feature);
+
+    var valorNube = feature.get('nube');
+    var valorSombra = feature.get('sombra');
+
+    // El promedio de una banda binaria, multiplicado por 100,
+    // representa el porcentaje de pixeles clasificados.
+    var porcentajeNube = ee.Algorithms.If(
+      ee.Algorithms.IsEqual(valorNube, null),
+      null,
+      ee.Number(valorNube).multiply(100)
+    );
+
+    var porcentajeSombra = ee.Algorithms.If(
+      ee.Algorithms.IsEqual(valorSombra, null),
+      null,
+      ee.Number(valorSombra).multiply(100)
+    );
+
+    var sector = ee.String(
+      ee.Algorithms.If(
+        ee.Algorithms.IsEqual(feature.get('Sector'), null),
+        'sin_sector',
+        feature.get('Sector')
+      )
+    );
+
+    return feature.set({
+      'Sector_fecha': sector.cat('_2026-09-25'),
+      'fecha_muestreo': '2026-09-25',
+      'sensor': 'Sentinel-2',
+      'fecha_imagen': fechaImagen.format('YYYY-MM-dd'),
+      'diferencia_dias': 0,
+      'hora_UTC': fechaImagen.format('HH:mm'),
+      'hora_local': fechaLocal.format('HH:mm'),
+      'porcentaje_nube_sector': porcentajeNube,
+      'porcentaje_sombra_sector': porcentajeSombra,
+      'ID_imagen': image.get('system:index')
+    }).select([
+      'Sector',
+      'Sector_fecha',
+      'fecha_muestreo',
+      'sensor',
+      'fecha_imagen',
+      'diferencia_dias',
+      'hora_UTC',
+      'hora_local',
+      'porcentaje_nube_sector',
+      'porcentaje_sombra_sector',
+      'NDVI',
+      'SAVI',
+      'EVI',
+      'ID_imagen'
+    ]);
+  });
+
+  return salida;
+}
+
+
+// ==========================================================
+// 6. PROCESAR CADA IMAGEN SENTINEL-2
+// ==========================================================
+
+function procesarS2(coleccion) {
+
+  var listaImagenes = coleccion.toList(coleccion.size());
+
+  var resultados = listaImagenes.map(function(objeto) {
+
+    var imagenOriginal = ee.Image(objeto);
+    var imagenPreparada = prepararS2(imagenOriginal);
+
+    return extraerPorSector(imagenPreparada);
+  });
+
+  return ee.FeatureCollection(resultados).flatten();
+}
+
+
+// ==========================================================
+// 7. EJECUTAR Y REVISAR RESULTADOS
+// ==========================================================
+
+var resultadosFinales = procesarS2(S2);
+
+print('Vista previa de resultados:', resultadosFinales.limit(10));
+print('Cantidad total de registros:', resultadosFinales.size());
+
+
+// ==========================================================
+// 8. EXPORTAR CSV A GOOGLE DRIVE
+// ==========================================================
+
+Export.table.toDrive({
+  collection: resultadosFinales,
+  description: 'indices_Sentinel2_20260925',
+  fileFormat: 'CSV',
+  selectors: [
+    'Sector',
+    'Sector_fecha',
+    'fecha_muestreo',
+    'sensor',
+    'fecha_imagen',
+    'diferencia_dias',
+    'hora_UTC',
+    'hora_local',
+    'porcentaje_nube_sector',
+    'porcentaje_sombra_sector',
+    'NDVI',
+    'SAVI',
+    'EVI',
+    'ID_imagen'
+  ]
+});
